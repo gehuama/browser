@@ -31,3 +31,11 @@
     - 如果是开始标签，把Token压入栈中并且创建新的DOM节点并添加到父节点的children中
     - 如果是文本Token，则把文本节点添加到栈顶元素的children中，文本Token不需要入栈
     - 如果是结束标签，此开始标签出栈
+## CSS 转stylesheet
+- 渲染进程把css文本转化为浏览器中的stylesheet
+- css来源可能有link标签、style标签和style行内样式
+- 渲染引擎会把css转换 document.styleSheets
+
+## 计算出DOM节点的样式
+- 根据css的继承和层叠规则计算DOM节点的样式
+- DOM节点的样式保存在了ComputedStyle（计算出的样式）中
