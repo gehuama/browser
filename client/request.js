@@ -105,7 +105,21 @@ render.on("commitNavigation", (response) => {
         response.on("end", () => {
             // 计算每个DOM节点的具体的样式 继承 层叠
             recalculateStyle(cssRules, document);
-            console.dir(document, {depth: null});
+            // 创建一个只包含可见元素的布局树
+            const html = document.children[0];
+            const body = html.children[1];
+            const layoutTree = createLayoutTree(body);
+            // 更新布局树，计算每个元素布局信息
+            updateLayoutTree(layoutTree);
+            // 根据布局树生成图层树
+            const layers = [layoutTree];
+            // 创建图层树
+            createLayersTree(layoutTree, layers);
+            // 根据分层树生成绘制步骤，并复合图层
+            const paintSteps = compositeLayers(layers);
+            // 把步骤展开
+            console.log(paintSteps.flat().join("\r\n"));
+
             // 10.页面解析并加载资源
             // DOM解析完毕
             main.emit("DOMContentLoaded");
@@ -114,11 +128,146 @@ render.on("commitNavigation", (response) => {
         })
     }
 })
+/** 生成绘制步骤 */
+function compositeLayers(layers) {
+    return layers.map(layer => paint(layer));
+}
+/** 绘制 */
+function paint(element, paintSteps = []) {
+    const { top = 0, left = 0, color = "black", background = "white", width = 100, height = 0 } = element.layout;
+    if (element.type == "text") {
+        /** 用canvas 模拟绘图指令 */
+        // 字体大小
+        paintSteps.push(`ctx.font = "20px Impact"`);
+        // 字体颜色
+        paintSteps.push(`ctx.strokeStyle = "${color}"`);
+        // 写入文字 干掉空格
+        paintSteps.push(`ctx.strokeText("${element.text}",${parseFloat(left)}, ${parseFloat(top) + 20})`);
+    } else {
+        // 背景颜色
+        paintSteps.push(`ctx.fillStyle= "${background}"`);
+        // 绘制矩形
+        paintSteps.push(`ctx.fillRect(${parseFloat(left)},${parseFloat(top)},${parseFloat(width)},${parseFloat(height)})`)
+    }
+    element.children.forEach(child=>paint(child, paintSteps))
+    return paintSteps;
+}
+
+/** 创建图层树 */
+function createLayersTree(element, layers) {
+    // 遍历子节点，判断是否是否要生成新的图层，如果生成，则从当前图层中删除
+    element.children = element.children.filter(child => !createNewLayer(child, layers));
+    /* 递归子元素 */
+    element.children.forEach(child => createLayersTree(child, layers));
+    return layers;
+}
+/** 创建分层树 */
+function createNewLayer(element, layers) {
+    let newLayer = false;
+    const attributes = element.attributes;
+    Object.entries(attributes).forEach(([key, value]) => {
+        /** 行内样式 */
+        if (key === 'style') {
+            /** 获取 属性为style的值 并以“；”对其进行分割
+             * 例如 <div id="hello" style="background: green;">hello</div>
+             * attributes = ["background: green"]
+             *  */
+            const attributes = value.split(/;\s*/);
+            /** attribute : "background: green"*/
+            attributes.forEach((attribute) => {
+                /** property:background 
+                 *  value: green
+                 * */
+                const [property, value] = attribute.split(/:\s*/);
+                if (property) {
+                    element.computedStyle[property] = value;
+                    if (property === 'position' && (value === "absolute" || value === "fixed")) {
+                        // 因为这是一个新的层，所以里面的元素需要重新计算一下自己的布局位置
+                        updateLayoutTree(element)
+                        layers.push(element)
+                        newLayer = true;
+                    }
+                }
+
+            })
+        }
+    });
+    return newLayer;
+}
+/** 更新布局树
+ * 计算布局树上每个元素的布局信息
+ * @param {*} element
+ * @param {*} top 自己距离自己父节点顶部距离
+ * @param {*} parentTop 父节点居顶部距离
+ */
+function updateLayoutTree(element, top = 0, parentTop = 0) {
+    const computedStyle = element.computedStyle;
+    /** 构建元素布局 */
+    element.layout = {
+        /**
+         * https://www.processon.com/diagraming/61d9d245e401fd06a8be45a4
+         * layout.top=top(自己距离自己父节点顶部距离)+parentTop(父节点居顶部距离)
+         * */
+        top: top + parentTop,
+        left: 0,
+        width: computedStyle.width,
+        height: computedStyle.height,
+        color: computedStyle.color,
+        background: computedStyle.background
+    }
+    let childTop = 0;
+    element.children.forEach(child => {
+        updateLayoutTree(child, childTop, element.layout.top);
+        childTop += parseFloat(child.computedStyle.height || 0);
+    })
+}
+/** 创建布局树 */
+function createLayoutTree(element) {
+    /** 过滤不需要生成布局的元素 */
+    element.children = element.children.filter(isShow);
+    /* 递归子元素 */
+    element.children.forEach(createLayoutTree);
+    return element;
+}
+/** 判断元素是否显示 */
+function isShow(element) {
+    let show = true; // 默认都显示
+    if (element.tagName === "head" || element.tagName === "script" || element.tagName === "link") {
+        show = false;
+    }
+    /** 拿到元素属性 */
+    const attributes = element.attributes;
+    Object.entries(attributes).forEach(([key, value]) => {
+        /** 行内样式 */
+        if (key === 'style') {
+            /** 获取 属性为style的值 并以“；”对其进行分割
+             * 例如 <div id="hello" style="background: green;">hello</div>
+             * attributes = ["background: green"]
+             *  */
+            const attributes = value.split(/;\s*/);
+            /** attribute : "background: green"*/
+            attributes.forEach((attribute) => {
+                /** property:background 
+                 *  value: green
+                 * */
+                const [property, value] = attribute.split(/:\s*/);
+                if (property) {
+                    element.computedStyle[property] = value;
+                    if (property === 'display' && value === "none") {
+                        show = false;
+                    }
+                }
+
+            })
+        }
+    });
+    return show;
+}
 /** 计算元素样式 */
 function recalculateStyle(cssRules, element, parentStyle = {}) {
     /** 获取元素属性 */
     const attributes = element.attributes;
-    /** 样式继承 继承父节点样式 */
+    /** 样式继承 继承父节点样式 元素计算样式 */
     element.computedStyle = { color: parentStyle.color || "black" };
     /** Object.entries: 一个给定对象自身可枚举属性的键值对数组，其排列与使用 
      * 即可以把一个对象的键值以数组的形式遍历出来
@@ -156,7 +305,7 @@ function recalculateStyle(cssRules, element, parentStyle = {}) {
                  **/
                 rule.declarations.forEach(({ property, value }) => {
                     /** 样式计算属性 */
-                    if(property){
+                    if (property) {
                         element.computedStyle[property] = value;
                     }
                 })
@@ -168,17 +317,17 @@ function recalculateStyle(cssRules, element, parentStyle = {}) {
              * 例如 <div id="hello" style="background: green;">hello</div>
              * attributes = ["background: green"]
              *  */
-            const attributes = value.split(";");
+            const attributes = value.split(/;\s*/);
             /** attribute : "background: green"*/
             attributes.forEach((attribute) => {
                 /** property:background 
                  *  value: green
                  * */
                 const [property, value] = attribute.split(/:\s*/);
-                if(property){
+                if (property) {
                     element.computedStyle[property] = value;
                 }
-                
+
             })
         }
     });
@@ -191,5 +340,5 @@ function recalculateStyle(cssRules, element, parentStyle = {}) {
 main.emit("request", {
     host, // 域名
     port, // 端口
-    path: "/gitlab/web/browser/server/public/index.html" // 路径
+    path: "/gitlab/web/browser/server/public/postion.html" // 路径
 })
