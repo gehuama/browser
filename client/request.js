@@ -1,11 +1,16 @@
 const http = require("http");
 const htmlparser2 = require("htmlparser2")
 const css = require("css");
+const { createCanvas } = require("canvas");
+const fs = require("fs");
 const main = require("./main");
 const network = require("./network");
 const render = require("./render");
+const gpu = require("./gpu");
 const host = "127.0.0.1";
-const port = 8080
+const port = 80
+const loadingLinks = {};
+const loadingScripts = {};
 // 2.转发请求
 // 浏览器主进程接收请求，会把请求转发给网络进程
 main.on("request", function (options) {
@@ -19,6 +24,15 @@ main.on("prepareRender", function (response) {
     // 主进程发送提交导航的消息给渲染进程
     render.emit("commitNavigation", response);
 })
+/** */
+main.on("drawQuad", () => {
+    /** 把数组展开 */
+    let drawSteps = gpu.bitMaps.flat();
+    const canvas = createCanvas(150, 250);
+    const ctx = canvas.getContext("2d");
+    eval(drawSteps.join("\r\n"));
+    fs.writeFileSync("position.png", canvas.toBuffer("image/png"));
+});
 
 //**********网络进程********************
 network.on("request", (options) => {
@@ -89,6 +103,54 @@ render.on("commitNavigation", (response) => {
                         const rules = cssAST.stylesheet.rules;
                         cssRules.push(...rules);
                         break;
+                    case "link":
+                        const linkToken = tokenStack[tokenStack.length - 1];
+                        const href = linkToken.attributes.href;
+                        const options = { host, port, path: href };
+                        const promise = network.fetchResource(options).then(({ body }) => {
+                            // 请求完成
+                            delete loadingLinks[href];
+                            const cssAST = css.parse(body);
+                            const rules = cssAST.stylesheet.rules;
+                            cssRules.push(...rules);
+                        });
+                        //  请求中
+                        loadingLinks[href] = promise;
+                        break;
+                    case "script":
+                        const scriptToken = tokenStack[tokenStack.length - 1];
+                        const src = scriptToken.attributes.src;
+                        const promises = [
+                            ...Object.values(loadingLinks),
+                            ...Object.values(loadingScripts)
+                        ];
+                        if (src) {
+                            const options = { host, port, path: src };
+                            const promise = network.fetchResource(options).then(({ body }) => {
+                                // 请求完成
+                                delete loadingScripts[src];
+                                /* 等待前面css资源 和js资源都加载完毕 在执行自己 */
+                                return Promise.all(promises).then(() => {
+                                    /** 直接执行 */
+                                    eval(body);
+                                })
+                            });
+                            //  请求中
+                            loadingScripts[src] = promise;
+                        } else {
+                            const script = scriptToken.children[0].text;
+                            // 构造 纯js情况下 的promise脚本执行
+                            const ts = Date.now();
+                            /* 等待前面css资源 和js资源都加载完毕 在执行自己 */
+                            const promise = Promise.all(promises).then(() => {
+                                delete loadingScripts[ts];
+                                /** 直接执行 */
+                                eval(script);
+                            })
+                            //  请求中
+                            loadingScripts[ts] = promise;
+                        }
+                        break;
                     default:
                         break;
                 }
@@ -103,31 +165,65 @@ render.on("commitNavigation", (response) => {
         })
         // 9.文档传输完毕
         response.on("end", () => {
-            // 计算每个DOM节点的具体的样式 继承 层叠
-            recalculateStyle(cssRules, document);
-            // 创建一个只包含可见元素的布局树
-            const html = document.children[0];
-            const body = html.children[1];
-            const layoutTree = createLayoutTree(body);
-            // 更新布局树，计算每个元素布局信息
-            updateLayoutTree(layoutTree);
-            // 根据布局树生成图层树
-            const layers = [layoutTree];
-            // 创建图层树
-            createLayersTree(layoutTree, layers);
-            // 根据分层树生成绘制步骤，并复合图层
-            const paintSteps = compositeLayers(layers);
-            // 把步骤展开
-            console.log(paintSteps.flat().join("\r\n"));
+            /** 
+             * 需要等待所有的js都加载执行完毕了，才会进行后续的渲染流程
+             * 确定所有js都已经执行完成 */
+            Promise.all(Object.values(loadingScripts)).then(() => {
+                // js脚本执行完成，构建布局树 此时已经拿到 dom树、 样式规则、js脚本都以执行完成
+                // 计算每个DOM节点的具体的样式 继承 层叠
+                recalculateStyle(cssRules, document);
+                // 创建一个只包含可见元素的布局树
+                const html = document.children[0];
+                const body = html.children[1];
+                const layoutTree = createLayoutTree(body);
+                // 更新布局树，计算每个元素布局信息
+                updateLayoutTree(layoutTree);
+                // 根据布局树生成图层树
+                const layers = [layoutTree];
+                // 创建图层树
+                createLayersTree(layoutTree, layers);
+                // 根据分层树生成绘制步骤，并复合图层
+                const paintSteps = compositeLayers(layers);
+                // 把步骤展开 console.log(paintSteps.flat().join("\r\n"));
+                // 先切成一个个小的图块
+                const tiles = splitTiles(paintSteps);
+                rester(tiles);
 
-            // 10.页面解析并加载资源
-            // DOM解析完毕
-            main.emit("DOMContentLoaded");
-            // css和图片加载完完成后
-            main.emit("load")
+
+                // 10.页面解析并加载资源
+                // DOM解析完毕
+                main.emit("DOMContentLoaded");
+                // css和图片加载完完成后
+                main.emit("load")
+            })
+
         })
     }
 })
+/** 把切好的图片进行光栅化处理，变成类似马赛克的形式 */
+function rester(tiles) {
+    tiles.forEach(tile => rasterThread(tile));
+    // 到此位图生成完成
+    main.emit("drawQuad")
+}
+/** 光栅化线程
+ * 1个光栅化线程 1秒 1张
+ * 10个图片
+ * 10个线程 并发 1秒就可以画10张
+ */
+function rasterThread(tile) {
+    // 光栅化线程，实际把光栅化的工作交给GPU来完成 ，此过程叫快速光栅化 或者说GPU光栅化（GPU比较快）
+    gpu.emit("raster", tile)
+}
+/** 切分图块
+ * 为什么切分图块：优先生成做上角部分 逐步生成
+ */
+function splitTiles(paintSteps) {
+    /** 切分成一个个的图块 */
+    return paintSteps;
+
+}
+
 /** 生成绘制步骤 */
 function compositeLayers(layers) {
     return layers.map(layer => paint(layer));
@@ -149,7 +245,7 @@ function paint(element, paintSteps = []) {
         // 绘制矩形
         paintSteps.push(`ctx.fillRect(${parseFloat(left)},${parseFloat(top)},${parseFloat(width)},${parseFloat(height)})`)
     }
-    element.children.forEach(child=>paint(child, paintSteps))
+    element.children.forEach(child => paint(child, paintSteps))
     return paintSteps;
 }
 
@@ -335,10 +431,16 @@ function recalculateStyle(cssRules, element, parentStyle = {}) {
     element.children.forEach(child => recalculateStyle(cssRules, child, element.computedStyle));
 }
 
+/** GPU进程负责把图片光栅化，生成位图并保存到GPU内存里 */
+gpu.on("raster", (tile) => {
+    let bitMap = tile;
+    gpu.bitMaps.push(bitMap);
+})
+
 // 1.输入URL地址 
 // 由主进程接收用户输入的URL地址
 main.emit("request", {
     host, // 域名
     port, // 端口
-    path: "/gitlab/web/browser/server/public/postion.html" // 路径
+    path: "/load.html" // 路径
 })
